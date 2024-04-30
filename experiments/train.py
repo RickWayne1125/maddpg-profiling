@@ -3,10 +3,42 @@ import numpy as np
 import tensorflow as tf
 import time
 import pickle
+import json
 
 import maddpg.common.tf_util as U
 from maddpg.trainer.maddpg import MADDPGAgentTrainer
 import tensorflow.contrib.layers as layers
+
+
+class RoundLatency:
+    def __init__(self, round_number):
+        self.round_number = round_number
+        self.env_latency = None
+        self.agents = {}
+
+    def set_env_latency(self, latency):
+        self.env_latency = latency
+
+    def set_agent_latency(self, agent_id, critic_latency=None, policy_latency=None, action_latency=None):
+        if agent_id not in self.agents:
+            self.agents[agent_id] = {}
+        if critic_latency is not None:
+            self.agents[agent_id]['critic'] = critic_latency
+        if policy_latency is not None:
+            self.agents[agent_id]['policy'] = policy_latency
+        if action_latency is not None:
+            self.agents[agent_id]['action'] = action_latency
+
+    def to_dict(self):
+        return {
+            "Round": self.round_number,
+            "Environment": self.env_latency,
+            "Agents": self.agents
+        }
+
+    def to_json(self):
+        return json.dumps(self.to_dict(), indent=4)
+
 
 def parse_args():
     parser = argparse.ArgumentParser("Reinforcement Learning experiments for multiagent environments")
@@ -24,17 +56,23 @@ def parse_args():
     parser.add_argument("--num-units", type=int, default=64, help="number of units in the mlp")
     # Checkpointing
     parser.add_argument("--exp-name", type=str, default=None, help="name of the experiment")
-    parser.add_argument("--save-dir", type=str, default="/tmp/policy/", help="directory in which training state and model should be saved")
-    parser.add_argument("--save-rate", type=int, default=1000, help="save model once every time this many episodes are completed")
-    parser.add_argument("--load-dir", type=str, default="", help="directory in which training state and model are loaded")
+    parser.add_argument("--save-dir", type=str, default="/tmp/policy/",
+                        help="directory in which training state and model should be saved")
+    parser.add_argument("--save-rate", type=int, default=1000,
+                        help="save model once every time this many episodes are completed")
+    parser.add_argument("--load-dir", type=str, default="",
+                        help="directory in which training state and model are loaded")
     # Evaluation
     parser.add_argument("--restore", action="store_true", default=False)
     parser.add_argument("--display", action="store_true", default=False)
     parser.add_argument("--benchmark", action="store_true", default=False)
     parser.add_argument("--benchmark-iters", type=int, default=100000, help="number of iterations run for benchmarking")
-    parser.add_argument("--benchmark-dir", type=str, default="./benchmark_files/", help="directory where benchmark data is saved")
-    parser.add_argument("--plots-dir", type=str, default="./learning_curves/", help="directory where plot data is saved")
+    parser.add_argument("--benchmark-dir", type=str, default="./benchmark_files/",
+                        help="directory where benchmark data is saved")
+    parser.add_argument("--plots-dir", type=str, default="./learning_curves/",
+                        help="directory where plot data is saved")
     return parser.parse_args()
+
 
 def mlp_model(input, num_outputs, scope, reuse=False, num_units=64, rnn_cell=None):
     # This model takes as input an observation and returns values of all actions
@@ -44,6 +82,7 @@ def mlp_model(input, num_outputs, scope, reuse=False, num_units=64, rnn_cell=Non
         out = layers.fully_connected(out, num_outputs=num_units, activation_fn=tf.nn.relu)
         out = layers.fully_connected(out, num_outputs=num_outputs, activation_fn=None)
         return out
+
 
 def make_env(scenario_name, arglist, benchmark=False):
     from multiagent.environment import MultiAgentEnv
@@ -60,6 +99,7 @@ def make_env(scenario_name, arglist, benchmark=False):
         env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation)
     return env
 
+
 def get_trainers(env, num_adversaries, obs_shape_n, arglist):
     trainers = []
     model = mlp_model
@@ -67,11 +107,11 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
     for i in range(num_adversaries):
         trainers.append(trainer(
             "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist,
-            local_q_func=(arglist.adv_policy=='ddpg')))
+            local_q_func=(arglist.adv_policy == 'ddpg')))
     for i in range(num_adversaries, env.n):
         trainers.append(trainer(
             "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist,
-            local_q_func=(arglist.good_policy=='ddpg')))
+            local_q_func=(arglist.good_policy == 'ddpg')))
     return trainers
 
 
@@ -106,12 +146,25 @@ def train(arglist):
         train_step = 0
         t_start = time.time()
 
+        profiling_latencies = []
+
         print('Starting iterations...')
         while True:
+            round_latency = RoundLatency(train_step)
             # get action
-            action_n = [agent.action(obs) for agent, obs in zip(trainers,obs_n)]
+            # action_n = [agent.action(obs) for agent, obs in zip(trainers, obs_n)]
+            action_n = []
+            for agent, obs in zip(trainers, obs_n):
+                action_latency = time.time()
+                action = agent.action(obs)
+                action_latency = time.time() - action_latency
+                round_latency.set_agent_latency(agent.name, action_latency=action_latency)
+                action_n.append(action)
             # environment step
+            env_latency = time.time()
             new_obs_n, rew_n, done_n, info_n = env.step(action_n)
+            env_latency = time.time() - env_latency
+            round_latency.set_env_latency(env_latency)
             episode_step += 1
             done = all(done_n)
             terminal = (episode_step >= arglist.max_episode_len)
@@ -159,6 +212,10 @@ def train(arglist):
                 agent.preupdate()
             for agent in trainers:
                 loss = agent.update(trainers, train_step)
+                round_latency.set_agent_latency(agent.name, agent.critic_latency, agent.policy_latency)
+
+            print(round_latency.to_json())
+            profiling_latencies.append(round_latency.to_dict())
 
             # save model, display training output
             if terminal and (len(episode_rewards) % arglist.save_rate == 0):
@@ -166,11 +223,12 @@ def train(arglist):
                 # print statement depends on whether or not there are adversaries
                 if num_adversaries == 0:
                     print("steps: {}, episodes: {}, mean episode reward: {}, time: {}".format(
-                        train_step, len(episode_rewards), np.mean(episode_rewards[-arglist.save_rate:]), round(time.time()-t_start, 3)))
+                        train_step, len(episode_rewards), np.mean(episode_rewards[-arglist.save_rate:]),
+                        round(time.time() - t_start, 3)))
                 else:
                     print("steps: {}, episodes: {}, mean episode reward: {}, agent episode reward: {}, time: {}".format(
                         train_step, len(episode_rewards), np.mean(episode_rewards[-arglist.save_rate:]),
-                        [np.mean(rew[-arglist.save_rate:]) for rew in agent_rewards], round(time.time()-t_start, 3)))
+                        [np.mean(rew[-arglist.save_rate:]) for rew in agent_rewards], round(time.time() - t_start, 3)))
                 t_start = time.time()
                 # Keep track of final episode reward
                 final_ep_rewards.append(np.mean(episode_rewards[-arglist.save_rate:]))
@@ -179,6 +237,8 @@ def train(arglist):
 
             # saves final episode reward for plotting training curve later
             if len(episode_rewards) > arglist.num_episodes:
+                with open('profiling_latencies.json', 'w') as f:
+                    json.dump(profiling_latencies, f)
                 rew_file_name = arglist.plots_dir + arglist.exp_name + '_rewards.pkl'
                 with open(rew_file_name, 'wb') as fp:
                     pickle.dump(final_ep_rewards, fp)
@@ -187,6 +247,10 @@ def train(arglist):
                     pickle.dump(final_ep_ag_rewards, fp)
                 print('...Finished total of {} episodes.'.format(len(episode_rewards)))
                 break
+
+        with open('profiling_latencies.json', 'w') as f:
+            json.dump(profiling_latencies, f)
+
 
 if __name__ == '__main__':
     arglist = parse_args()
